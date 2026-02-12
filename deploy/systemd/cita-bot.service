@@ -1,0 +1,22 @@
+[Unit]
+Description=CitaConsular slot monitor Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cita_bot/app
+EnvironmentFile=/etc/default/cita-bot
+ExecStart=/opt/cita_bot/app/.venv/bin/python -m cita_bot
+Restart=always
+RestartSec=3
+# Hardening (умеренно, чтобы Playwright работал)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/cita_bot/data /opt/cita_bot/logs
+UMask=027
+
+[Install]
+WantedBy=multi-user.target
