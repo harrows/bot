@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
-import asyncio
-
+from typing import List, Optional
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS subscribers (
@@ -49,35 +48,37 @@ class Database:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
 
-    async def ainit(self) -> None:
-        await asyncio.to_thread(self.init)
+    async def aadd_subscriber(self, chat_id: int, created_at: str) -> None:
+        await asyncio.to_thread(self._add_subscriber, chat_id, created_at)
 
-    def add_subscriber(self, chat_id: int, created_at: str) -> None:
+    def _add_subscriber(self, chat_id: int, created_at: str) -> None:
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO subscribers(chat_id, created_at) VALUES(?, ?)",
                 (chat_id, created_at),
             )
 
-    async def aadd_subscriber(self, chat_id: int, created_at: str) -> None:
-        await asyncio.to_thread(self.add_subscriber, chat_id, created_at)
+    async def aremove_subscriber(self, chat_id: int) -> None:
+        await asyncio.to_thread(self._remove_subscriber, chat_id)
 
-    def remove_subscriber(self, chat_id: int) -> None:
+    def _remove_subscriber(self, chat_id: int) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
 
-    async def aremove_subscriber(self, chat_id: int) -> None:
-        await asyncio.to_thread(self.remove_subscriber, chat_id)
+    async def alist_subscribers(self) -> List[int]:
+        return await asyncio.to_thread(self._list_subscribers)
 
-    def list_subscribers(self) -> List[int]:
+    def _list_subscribers(self) -> List[int]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT chat_id FROM subscribers ORDER BY created_at").fetchall()
+            rows = conn.execute(
+                "SELECT chat_id FROM subscribers ORDER BY created_at"
+            ).fetchall()
         return [int(r[0]) for r in rows]
 
-    async def alist_subscribers(self) -> List[int]:
-        return await asyncio.to_thread(self.list_subscribers)
+    async def aset_setting(self, key: str, value: str) -> None:
+        await asyncio.to_thread(self._set_setting, key, value)
 
-    def set_setting(self, key: str, value: str) -> None:
+    def _set_setting(self, key: str, value: str) -> None:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO settings(key, value) VALUES(?, ?) "
@@ -85,30 +86,29 @@ class Database:
                 (key, value),
             )
 
-    async def aset_setting(self, key: str, value: str) -> None:
-        await asyncio.to_thread(self.set_setting, key, value)
+    async def aget_setting(self, key: str) -> Optional[str]:
+        return await asyncio.to_thread(self._get_setting, key)
 
-    def get_setting(self, key: str) -> Optional[str]:
+    def _get_setting(self, key: str) -> Optional[str]:
         with self._connect() as conn:
-            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
         return row[0] if row else None
 
-    async def aget_setting(self, key: str) -> Optional[str]:
-        return await asyncio.to_thread(self.get_setting, key)
-
-    def get_interval_seconds(self, default_value: int) -> int:
-        v = self.get_setting("interval_seconds")
+    async def aget_interval_seconds(self, default_value: int) -> int:
+        v = await self.aget_setting("interval_seconds")
         if not v:
             return default_value
         try:
-            return max(15, int(v))
+            return max(30, int(v))
         except ValueError:
             return default_value
 
-    async def aget_interval_seconds(self, default_value: int) -> int:
-        return await asyncio.to_thread(self.get_interval_seconds, default_value)
+    async def aupdate_last_check(self, checked_at: str, has_slots: bool, summary: str) -> None:
+        await asyncio.to_thread(self._update_last_check, checked_at, has_slots, summary)
 
-    def update_last_check(self, checked_at: str, has_slots: bool, summary: str) -> None:
+    def _update_last_check(self, checked_at: str, has_slots: bool, summary: str) -> None:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO last_check(id, checked_at, has_slots, summary) VALUES(1, ?, ?, ?) "
@@ -116,16 +116,15 @@ class Database:
                 (checked_at, 1 if has_slots else 0, summary),
             )
 
-    async def aupdate_last_check(self, checked_at: str, has_slots: bool, summary: str) -> None:
-        await asyncio.to_thread(self.update_last_check, checked_at, has_slots, summary)
+    async def aget_last_check(self) -> LastCheck:
+        return await asyncio.to_thread(self._get_last_check)
 
-    def get_last_check(self) -> LastCheck:
+    def _get_last_check(self) -> LastCheck:
         with self._connect() as conn:
-            row = conn.execute("SELECT checked_at, has_slots, summary FROM last_check WHERE id = 1").fetchone()
+            row = conn.execute(
+                "SELECT checked_at, has_slots, summary FROM last_check WHERE id = 1"
+            ).fetchone()
         if not row:
             return LastCheck(None, None, None)
         checked_at, has_slots, summary = row
         return LastCheck(checked_at, bool(has_slots) if has_slots is not None else None, summary)
-
-    async def aget_last_check(self) -> LastCheck:
-        return await asyncio.to_thread(self.get_last_check)

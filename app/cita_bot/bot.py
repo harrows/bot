@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .checker import check_once, CheckResult
 from .config import load_settings
@@ -18,45 +18,49 @@ log = logging.getLogger("cita_bot")
 
 JOB_NAME = "cita_monitor_job"
 
-
-def is_admin(user_id: Optional[int], admins: list[int]) -> bool:
-    return bool(user_id) and user_id in admins
-
-
-HELP_TEXT = (
-    "Команды:\n"
-    "/start — приветствие\n"
-    "/help — помощь\n"
-    "/status — статус мониторинга\n"
-    "/subscribe — подписать этот чат на уведомления\n"
-    "/unsubscribe — отписать этот чат\n"
-    "/start_monitor [сек] — включить мониторинг (например /start_monitor 180)\n"
-    "/stop_monitor — выключить мониторинг\n"
-    "/set_interval <сек> — изменить интервал (минимум 30 сек рекомендовано)\n"
-    "\n"
-    "Админ-команды:\n"
-    "/list_subscribers — список подписчиков\n"
-    "/test — тестовое уведомление\n"
-)
-
-# Ключи в settings-таблице
 KEY_INTERVAL = "interval_seconds"
 KEY_MONITOR_ENABLED = "monitor_enabled"
 KEY_LAST_DIGEST = "last_digest"
 KEY_LAST_HAS_SLOTS = "last_has_slots"
 
+BTN_STATUS = "📊 Статус"
+BTN_SUBSCRIBE = "🔔 Подписаться"
+BTN_UNSUBSCRIBE = "🔕 Отписаться"
+BTN_START = "🟢 Старт мониторинга"
+BTN_STOP = "🔴 Стоп мониторинга"
+BTN_INTERVAL = "⏱ Интервал"
+BTN_HELP = "ℹ️ Помощь"
+
+MAIN_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(BTN_STATUS), KeyboardButton(BTN_HELP)],
+        [KeyboardButton(BTN_SUBSCRIBE), KeyboardButton(BTN_UNSUBSCRIBE)],
+        [KeyboardButton(BTN_START), KeyboardButton(BTN_STOP)],
+        [KeyboardButton(BTN_INTERVAL)],
+    ],
+    resize_keyboard=True,
+)
+
+HELP_TEXT = (
+    "Я мониторю слоты записи на citaconsular.es и уведомляю подписанные чаты.\n\n"
+    "Как пользоваться:\n"
+    "1) Нажми «🔔 Подписаться» в нужном чате (личка или группа)\n"
+    "2) Нажми «🟢 Старт мониторинга»\n"
+    "3) При появлении слотов я пришлю уведомление.\n\n"
+    "Интервал можно менять кнопкой «⏱ Интервал».\n"
+)
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Привет! Я мониторю слоты записи на citaconsular.es и уведомляю при появлении.\n\n"
-        "1) В этом чате: /subscribe\n"
-        "2) Включить мониторинг: /start_monitor 180\n"
-        "Помощь: /help"
+        "Привет! Я готов.\n\n"
+        "Нажми «🔔 Подписаться» → потом «🟢 Старт мониторинга».",
+        reply_markup=MAIN_KB,
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(HELP_TEXT, reply_markup=MAIN_KB)
 
 
 async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -64,54 +68,14 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat_id = update.effective_chat.id
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     await db.aadd_subscriber(chat_id, created_at)
-    await update.message.reply_text("✅ Чат подписан на уведомления.")
+    await update.message.reply_text("✅ Чат подписан на уведомления.", reply_markup=MAIN_KB)
 
 
 async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: Database = context.application.bot_data["db"]
     chat_id = update.effective_chat.id
     await db.aremove_subscriber(chat_id)
-    await update.message.reply_text("🟡 Чат отписан от уведомлений.")
-
-
-async def cmd_list_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = context.application.bot_data["settings"]
-    if not is_admin(update.effective_user.id if update.effective_user else None, settings.admins):
-        await update.message.reply_text("⛔ Только для админов.")
-        return
-    db: Database = context.application.bot_data["db"]
-    subs = await db.alist_subscribers()
-    if not subs:
-        await update.message.reply_text("Подписчиков нет.")
-        return
-    await update.message.reply_text("Подписчики (chat_id):\n" + "\n".join(str(x) for x in subs))
-
-
-async def cmd_set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db: Database = context.application.bot_data["db"]
-    settings = context.application.bot_data["settings"]
-
-    args = context.args
-    if not args:
-        cur = await db.aget_interval_seconds(settings.default_interval_seconds)
-        await update.message.reply_text(f"Текущий интервал: {cur} сек. Используй: /set_interval <сек>")
-        return
-
-    try:
-        sec = int(args[0])
-        # важно: слишком частые проверки могут триггерить защиту
-        sec = max(30, sec)
-    except ValueError:
-        await update.message.reply_text("Нужно число секунд. Пример: /set_interval 180")
-        return
-
-    await db.aset_setting(KEY_INTERVAL, str(sec))
-    await update.message.reply_text(f"✅ Интервал установлен: {sec} сек.")
-
-    # Если мониторинг уже работает — перезапустим job с новым интервалом
-    if context.job_queue.get_jobs_by_name(JOB_NAME):
-        await _restart_monitoring_job(context, sec)
-        await update.message.reply_text("🔁 Мониторинг перезапущен с новым интервалом.")
+    await update.message.reply_text("🟡 Чат отписан от уведомлений.", reply_markup=MAIN_KB)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -129,60 +93,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await update.message.reply_text(
         f"Мониторинг: {'🟢 запущен' if running else '🔴 остановлен'}\n"
-        f"Флаг monitor_enabled в БД: {enabled or '0'}\n"
+        f"Флаг monitor_enabled: {enabled or '0'}\n"
         f"Интервал: {interval} сек\n"
-        f"Последняя проверка: {last_line}"
+        f"Последняя проверка: {last_line}",
+        reply_markup=MAIN_KB,
     )
 
 
-async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = context.application.bot_data["settings"]
-    if not is_admin(update.effective_user.id if update.effective_user else None, settings.admins):
-        await update.message.reply_text("⛔ Только для админов.")
-        return
-    await _notify_all(context, "✅ Тестовое уведомление. Бот работает.")
-
-
-async def cmd_start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db: Database = context.application.bot_data["db"]
-    settings = context.application.bot_data["settings"]
-
-    interval = await db.aget_interval_seconds(settings.default_interval_seconds)
-
-    if context.args:
-        try:
-            interval = max(30, int(context.args[0]))
-            await db.aset_setting(KEY_INTERVAL, str(interval))
-        except ValueError:
-            await update.message.reply_text("Нужно число секунд. Пример: /start_monitor 180")
-            return
-
-    if context.job_queue.get_jobs_by_name(JOB_NAME):
-        await update.message.reply_text("Мониторинг уже запущен. /status")
-        return
-
-    # ВАЖНО: сохраняем флаг, чтобы после твоих рестартов мониторинг сам восстановился
-    await db.aset_setting(KEY_MONITOR_ENABLED, "1")
-
-    await _start_monitoring_job(context, interval)
-    await update.message.reply_text(f"🟢 Мониторинг запущен. Интервал: {interval} сек. /status")
-
-
-async def cmd_stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db: Database = context.application.bot_data["db"]
-
-    jobs = context.job_queue.get_jobs_by_name(JOB_NAME)
-    for j in jobs:
-        j.schedule_removal()
-
-    # Сбрасываем флаг — после рестарта мониторинг не поднимется сам
-    await db.aset_setting(KEY_MONITOR_ENABLED, "0")
-
-    await update.message.reply_text("🔴 Мониторинг остановлен. /status")
-
-
 async def _start_monitoring_job(context: ContextTypes.DEFAULT_TYPE, interval: int) -> None:
-    # мониторинг общий (один job) на всех подписчиков
     context.job_queue.run_repeating(
         monitor_tick,
         interval=interval,
@@ -193,20 +111,37 @@ async def _start_monitoring_job(context: ContextTypes.DEFAULT_TYPE, interval: in
 
 
 async def _restart_monitoring_job(context: ContextTypes.DEFAULT_TYPE, interval: int) -> None:
-    jobs = context.job_queue.get_jobs_by_name(JOB_NAME)
-    for j in jobs:
+    for j in context.job_queue.get_jobs_by_name(JOB_NAME):
         j.schedule_removal()
     await asyncio.sleep(0.2)
     await _start_monitoring_job(context, interval)
 
 
+async def cmd_start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.application.bot_data["db"]
+    settings = context.application.bot_data["settings"]
+    interval = await db.aget_interval_seconds(settings.default_interval_seconds)
+
+    if context.job_queue.get_jobs_by_name(JOB_NAME):
+        await update.message.reply_text("Мониторинг уже запущен. Нажми «📊 Статус».", reply_markup=MAIN_KB)
+        return
+
+    await db.aset_setting(KEY_MONITOR_ENABLED, "1")
+    await _start_monitoring_job(context, interval)
+    await update.message.reply_text(f"🟢 Мониторинг запущен. Интервал: {interval} сек.", reply_markup=MAIN_KB)
+
+
+async def cmd_stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.application.bot_data["db"]
+    for j in context.job_queue.get_jobs_by_name(JOB_NAME):
+        j.schedule_removal()
+    await db.aset_setting(KEY_MONITOR_ENABLED, "0")
+    await update.message.reply_text("🔴 Мониторинг остановлен.", reply_markup=MAIN_KB)
+
+
 async def _notify_all(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     db: Database = context.application.bot_data["db"]
     subs = await db.alist_subscribers()
-    if not subs:
-        log.info("No subscribers; skipping notify")
-        return
-
     for chat_id in subs:
         try:
             await context.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
@@ -228,7 +163,6 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         await db.aupdate_last_check(res.checked_at, res.has_slots, res.summary)
 
-        # антиспам: уведомляем только при изменении digest и при наличии слотов
         prev_digest = await db.aget_setting(KEY_LAST_DIGEST)
         prev_has_slots = await db.aget_setting(KEY_LAST_HAS_SLOTS)
 
@@ -254,27 +188,19 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def auto_restore_monitoring(app: Application) -> None:
-    """
-    Главная фишка: после любого твоего рестарта/деплоя мониторинг сам поднимется,
-    если в БД стоит monitor_enabled=1 и есть подписчики.
-    """
     settings = app.bot_data["settings"]
     db: Database = app.bot_data["db"]
 
     enabled = await db.aget_setting(KEY_MONITOR_ENABLED)
     if enabled != "1":
-        log.info("Auto-restore: monitor_enabled != 1; skip")
         return
 
     subs = await db.alist_subscribers()
     if not subs:
-        log.info("Auto-restore: no subscribers; skip")
         return
 
     interval = await db.aget_interval_seconds(settings.default_interval_seconds)
-
     if app.job_queue.get_jobs_by_name(JOB_NAME):
-        log.info("Auto-restore: job already exists; skip")
         return
 
     app.job_queue.run_repeating(
@@ -287,6 +213,56 @@ async def auto_restore_monitoring(app: Application) -> None:
     log.info("Auto-restored monitoring: interval=%s sec, subscribers=%s", interval, len(subs))
 
 
+async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+
+    if text == BTN_STATUS:
+        await cmd_status(update, context)
+        return
+    if text == BTN_HELP:
+        await cmd_help(update, context)
+        return
+    if text == BTN_SUBSCRIBE:
+        await cmd_subscribe(update, context)
+        return
+    if text == BTN_UNSUBSCRIBE:
+        await cmd_unsubscribe(update, context)
+        return
+    if text == BTN_START:
+        await cmd_start_monitor(update, context)
+        return
+    if text == BTN_STOP:
+        await cmd_stop_monitor(update, context)
+        return
+    if text == BTN_INTERVAL:
+        await update.message.reply_text(
+            "Введи интервал в секундах (минимум 30), например: 180\n"
+            "Я восприму следующее сообщение как интервал.",
+            reply_markup=MAIN_KB,
+        )
+        context.user_data["awaiting_interval"] = True
+        return
+
+    if context.user_data.get("awaiting_interval"):
+        m = re.fullmatch(r"\s*(\d+)\s*", text)
+        if not m:
+            await update.message.reply_text("Нужно число. Например: 180", reply_markup=MAIN_KB)
+            return
+        sec = max(30, int(m.group(1)))
+        db: Database = context.application.bot_data["db"]
+        await db.aset_setting(KEY_INTERVAL, str(sec))
+        context.user_data["awaiting_interval"] = False
+
+        await update.message.reply_text(f"✅ Интервал установлен: {sec} сек.", reply_markup=MAIN_KB)
+
+        if context.job_queue.get_jobs_by_name(JOB_NAME):
+            await _restart_monitoring_job(context, sec)
+            await update.message.reply_text("🔁 Мониторинг перезапущен с новым интервалом.", reply_markup=MAIN_KB)
+        return
+
+
 def build_app() -> Application:
     settings = load_settings()
     setup_logging(Path(settings.log_dir))
@@ -295,7 +271,6 @@ def build_app() -> Application:
     db.init()
 
     async def _post_init(app: Application):
-        # автоподнятие мониторинга после рестартов
         await auto_restore_monitoring(app)
 
     app = Application.builder().token(settings.tg_bot_token).post_init(_post_init).build()
@@ -310,9 +285,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("start_monitor", cmd_start_monitor))
     app.add_handler(CommandHandler("stop_monitor", cmd_stop_monitor))
-    app.add_handler(CommandHandler("set_interval", cmd_set_interval))
-    app.add_handler(CommandHandler("list_subscribers", cmd_list_subscribers))
-    app.add_handler(CommandHandler("test", cmd_test))
+
+    # кнопки меню
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu_text))
 
     return app
 

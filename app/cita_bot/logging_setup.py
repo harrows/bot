@@ -11,8 +11,6 @@ def setup_logging(log_dir: Path) -> None:
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("telegram").setLevel(logging.INFO)
 
     fmt = logging.Formatter(
         fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -23,6 +21,11 @@ def setup_logging(log_dir: Path) -> None:
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(logfile, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    fh = RotatingFileHandler(
+        logfile, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+    )
     fh.setFormatter(fmt)
     root.addHandler(fh)
+
+    # меньше шума и меньше риска случайно залогировать что-то лишнее
+    logging.getLogger("httpx").setLevel(logging.WARNING)
