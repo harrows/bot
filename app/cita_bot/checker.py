@@ -10,23 +10,26 @@ from pathlib import Path
 from typing import Optional, Sequence, Union
 
 from playwright.async_api import async_playwright, Page, Frame, BrowserContext
+from playwright._impl._errors import TargetClosedError
 
-# "Слотов нет" (расширяй по мере наблюдений)
+# ---- Настройки под "быстро поймать слот" ----
+MAX_ATTEMPTS = 3
+
+# Если сайт отдаёт пусто (часто признак антибота) — охлаждение длиннее
+BACKOFF_EMPTY_PAGE = (120, 240)  # 2–4 минуты
+# Если просто не нашли кнопку — короткий бэкофф
+BACKOFF_NO_BUTTON = (10, 25)
+
+NAV_TIMEOUT_MS = 45_000
+CLICK_TIMEOUT_MS = 30_000
+
+# Весь check_once не должен жить дольше этого (чтобы не блокировать мониторинг)
+TOTAL_TIMEOUT_SECONDS = 110
+
 NO_SLOTS_PATTERNS = [
     r"No hay horas disponibles",
     r"Inténtelo de nuevo",
 ]
-
-# Ретраи
-MAX_ATTEMPTS = 3
-
-# Бэкоффы (чтобы не усугублять антибот-защиту)
-BACKOFF_NO_BUTTON = (20, 60)       # кнопки нет, но страница не пустая
-BACKOFF_EMPTY_PAGE = (180, 420)    # страница пустая -> похоже на защиту/заглушку
-
-# Таймауты
-NAV_TIMEOUT_MS = 60_000
-CLICK_TIMEOUT_MS = 60_000
 
 
 @dataclass(frozen=True)
@@ -63,7 +66,6 @@ async def _dump_debug(page: Page, data_dir: Path, prefix: str) -> tuple[str, str
 
 
 def _scopes(page: Page) -> list[Union[Page, Frame]]:
-    # main page + все фреймы (iframe)
     return [page] + list(page.frames)
 
 
@@ -78,7 +80,6 @@ async def _first_existing(locator_candidates: Sequence) -> Optional:
 
 
 async def _find_continue_anywhere(page: Page) -> Optional:
-    # Ищем кнопку во всех scope: main + iframe
     for scope in _scopes(page):
         btn = await _first_existing(
             [
@@ -95,19 +96,28 @@ async def _find_continue_anywhere(page: Page) -> Optional:
     return None
 
 
+async def _safe_close_context(ctx: BrowserContext) -> None:
+    try:
+        await ctx.close()
+    except TargetClosedError:
+        pass
+    except Exception:
+        # закрытие не должно падать и мешать мониторингу
+        pass
+
+
 async def _safe_networkidle(page: Page, timeout_ms: int) -> None:
-    # networkidle может не наступить — это ок
     try:
         await page.wait_for_load_state("networkidle", timeout=timeout_ms)
     except Exception:
         return
 
 
-async def check_once(
+async def _impl_check_once(
     target_url: str,
     data_dir: Path,
-    screenshot_on_slots: bool = True,
-    headless: bool = True,
+    screenshot_on_slots: bool,
+    headless: bool,
 ) -> CheckResult:
     checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -116,45 +126,40 @@ async def check_once(
     profile_dir = data_dir / "pw_profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
 
-    last_error: Optional[Exception] = None
-
     async with async_playwright() as p:
-        # Persistent context: сохраняем cookies/localStorage между тиками
-        context: BrowserContext = await p.chromium.launch_persistent_context(
+        ctx: BrowserContext = await p.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
             headless=headless,
             viewport={"width": 1280, "height": 720},
         )
+        page = await ctx.new_page()
 
-        page = await context.new_page()
-
-        # Автопринятие alert("Welcome / Bienvenido") -> OK
+        # Автопринятие alert("Welcome/Bienvenido")
         page.on("dialog", lambda d: asyncio.create_task(d.accept()))
+
+        last_error: Optional[Exception] = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                # джиттер перед попыткой
-                await page.wait_for_timeout(random.randint(250, 950))
+                # джиттер, чтобы не выглядеть как cron
+                await page.wait_for_timeout(random.randint(150, 650))
 
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
                 await _safe_networkidle(page, NAV_TIMEOUT_MS)
-                await page.wait_for_timeout(random.randint(800, 1600))
+                await page.wait_for_timeout(random.randint(400, 900))
 
-                # Быстрый индикатор "пустая страница"
-                body_text = ""
+                # Проверка на "пустую выдачу"
                 try:
                     body_text = await page.inner_text("body")
                 except Exception:
                     body_text = ""
+                normalized = _normalize(body_text or "")
 
-                normalized_body = _normalize(body_text or "")
-                if len(normalized_body) < 5:
+                if len(normalized) < 5:
                     png, html = await _dump_debug(page, data_dir, f"fail_empty_attempt{attempt}")
-                    # длинный бэкофф: похоже, сайт режет выдачу
                     await page.wait_for_timeout(random.randint(*BACKOFF_EMPTY_PAGE) * 1000)
-                    raise RuntimeError(f"Empty page (likely blocked). Debug saved: {png} {html}")
+                    raise RuntimeError(f"Empty page (likely protection). Debug saved: {png} {html}")
 
-                # Ищем Continue/Continuar
                 btn = await _find_continue_anywhere(page)
                 if not btn:
                     png, html = await _dump_debug(page, data_dir, f"fail_no_continue_attempt{attempt}")
@@ -164,12 +169,11 @@ async def check_once(
                 await btn.wait_for(state="visible", timeout=CLICK_TIMEOUT_MS)
                 await btn.click(timeout=CLICK_TIMEOUT_MS)
 
-                # Дать странице прогрузиться после клика
-                await _safe_networkidle(page, 30_000)
-                await page.wait_for_timeout(random.randint(900, 1800))
+                await _safe_networkidle(page, 20_000)
+                await page.wait_for_timeout(random.randint(500, 1200))
 
                 body_text2 = await page.inner_text("body")
-                normalized2 = _normalize(body_text2)
+                normalized2 = _normalize(body_text2 or "")
 
                 if len(normalized2) < 20:
                     png, html = await _dump_debug(page, data_dir, f"fail_empty_after_click_attempt{attempt}")
@@ -187,7 +191,7 @@ async def check_once(
                     await page.screenshot(path=str(out), full_page=True)
                     screenshot_path = str(out)
 
-                await context.close()
+                await _safe_close_context(ctx)
 
                 return CheckResult(
                     checked_at=checked_at,
@@ -199,9 +203,24 @@ async def check_once(
 
             except Exception as e:
                 last_error = e
-                # если есть ещё попытки — пробуем заново (перезагрузка/ожидание уже внутри)
                 if attempt < MAX_ATTEMPTS:
                     continue
-                await context.close()
+                await _safe_close_context(ctx)
                 raise last_error
-        raise RuntimeError("Unexpected exit from check_once() without result")
+
+        # mypy/линтеру для гарантий
+        await _safe_close_context(ctx)
+        raise RuntimeError("Unexpected exit from check loop without result")
+
+
+async def check_once(
+    target_url: str,
+    data_dir: Path,
+    screenshot_on_slots: bool = True,
+    headless: bool = True,
+) -> CheckResult:
+    # Жёсткий таймаут на весь чек — чтобы не было пропусков тиков
+    return await asyncio.wait_for(
+        _impl_check_once(target_url, data_dir, screenshot_on_slots, headless),
+        timeout=TOTAL_TIMEOUT_SECONDS,
+    )

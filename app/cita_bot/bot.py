@@ -99,7 +99,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         reply_markup=MAIN_KB,
     )
 
-
 async def _start_monitoring_job(context: ContextTypes.DEFAULT_TYPE, interval: int) -> None:
     context.job_queue.run_repeating(
         monitor_tick,
@@ -107,8 +106,12 @@ async def _start_monitoring_job(context: ContextTypes.DEFAULT_TYPE, interval: in
         first=1,
         name=JOB_NAME,
         data={"interval": interval},
+        job_kwargs={
+            "max_instances": 1,
+            "coalesce": True,
+            "misfire_grace_time": 60,
+        },
     )
-
 
 async def _restart_monitoring_job(context: ContextTypes.DEFAULT_TYPE, interval: int) -> None:
     for j in context.job_queue.get_jobs_by_name(JOB_NAME):
