@@ -128,3 +128,16 @@ class Database:
             return LastCheck(None, None, None)
         checked_at, has_slots, summary = row
         return LastCheck(checked_at, bool(has_slots) if has_slots is not None else None, summary)
+
+    # ---- helpers for int settings ----
+    async def aget_int(self, key: str, default: int = 0) -> int:
+        v = await self.aget_setting(key)
+        if v is None:
+            return default
+        try:
+            return int(v)
+        except ValueError:
+            return default
+
+    async def aset_int(self, key: str, value: int) -> None:
+        await self.aset_setting(key, str(int(value)))

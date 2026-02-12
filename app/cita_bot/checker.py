@@ -12,24 +12,28 @@ from typing import Optional, Sequence, Union
 from playwright.async_api import async_playwright, Page, Frame, BrowserContext
 from playwright._impl._errors import TargetClosedError
 
-# ---- Настройки под "быстро поймать слот" ----
-MAX_ATTEMPTS = 3
 
-# Если сайт отдаёт пусто (часто признак антибота) — охлаждение длиннее
-BACKOFF_EMPTY_PAGE = (120, 240)  # 2–4 минуты
-# Если просто не нашли кнопку — короткий бэкофф
-BACKOFF_NO_BUTTON = (10, 25)
+# ---- Быстрый и устойчивый чек (без длинных sleep внутри) ----
+MAX_ATTEMPTS = 2
 
 NAV_TIMEOUT_MS = 45_000
 CLICK_TIMEOUT_MS = 30_000
 
-# Весь check_once не должен жить дольше этого (чтобы не блокировать мониторинг)
-TOTAL_TIMEOUT_SECONDS = 110
+# Жёсткий лимит на один check_once (чтобы не блокировать job)
+TOTAL_TIMEOUT_SECONDS = 70
 
 NO_SLOTS_PATTERNS = [
     r"No hay horas disponibles",
     r"Inténtelo de nuevo",
 ]
+
+
+class EmptyPageError(RuntimeError):
+    """Сайт отдал пустую/заглушечную страницу (часто антибот/soft-block)."""
+
+
+class ContinueNotFoundError(RuntimeError):
+    """Не нашли Continue/Continuar (возможна смена разметки/iframe/заглушка)."""
 
 
 @dataclass(frozen=True)
@@ -102,7 +106,6 @@ async def _safe_close_context(ctx: BrowserContext) -> None:
     except TargetClosedError:
         pass
     except Exception:
-        # закрытие не должно падать и мешать мониторингу
         pass
 
 
@@ -134,21 +137,29 @@ async def _impl_check_once(
         )
         page = await ctx.new_page()
 
-        # Автопринятие alert("Welcome/Bienvenido")
+        # Принять alert("...OK...")
         page.on("dialog", lambda d: asyncio.create_task(d.accept()))
 
         last_error: Optional[Exception] = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                # джиттер, чтобы не выглядеть как cron
+                # небольшой джиттер
                 await page.wait_for_timeout(random.randint(150, 650))
 
-                await page.goto(target_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-                await _safe_networkidle(page, NAV_TIMEOUT_MS)
-                await page.wait_for_timeout(random.randint(400, 900))
+                resp = await page.goto(target_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                await _safe_networkidle(page, 20_000)
+                await page.wait_for_timeout(random.randint(300, 900))
 
-                # Проверка на "пустую выдачу"
+                # Если сайт отвечает странно — сохраним статус в html (иногда 403/503)
+                status = None
+                try:
+                    if resp:
+                        status = resp.status
+                except Exception:
+                    status = None
+
+                # Проверка на "пустую страницу"
                 try:
                     body_text = await page.inner_text("body")
                 except Exception:
@@ -156,29 +167,26 @@ async def _impl_check_once(
                 normalized = _normalize(body_text or "")
 
                 if len(normalized) < 5:
-                    png, html = await _dump_debug(page, data_dir, f"fail_empty_attempt{attempt}")
-                    await page.wait_for_timeout(random.randint(*BACKOFF_EMPTY_PAGE) * 1000)
-                    raise RuntimeError(f"Empty page (likely protection). Debug saved: {png} {html}")
+                    png, html = await _dump_debug(page, data_dir, f"fail_empty_s{status}_a{attempt}")
+                    raise EmptyPageError(f"Empty page (status={status}). Debug: {png} {html}")
 
                 btn = await _find_continue_anywhere(page)
                 if not btn:
-                    png, html = await _dump_debug(page, data_dir, f"fail_no_continue_attempt{attempt}")
-                    await page.wait_for_timeout(random.randint(*BACKOFF_NO_BUTTON) * 1000)
-                    raise RuntimeError(f"Continue button not found. Debug saved: {png} {html}")
+                    png, html = await _dump_debug(page, data_dir, f"fail_no_continue_s{status}_a{attempt}")
+                    raise ContinueNotFoundError(f"Continue not found (status={status}). Debug: {png} {html}")
 
                 await btn.wait_for(state="visible", timeout=CLICK_TIMEOUT_MS)
                 await btn.click(timeout=CLICK_TIMEOUT_MS)
 
                 await _safe_networkidle(page, 20_000)
-                await page.wait_for_timeout(random.randint(500, 1200))
+                await page.wait_for_timeout(random.randint(400, 1000))
 
                 body_text2 = await page.inner_text("body")
                 normalized2 = _normalize(body_text2 or "")
 
                 if len(normalized2) < 20:
-                    png, html = await _dump_debug(page, data_dir, f"fail_empty_after_click_attempt{attempt}")
-                    await page.wait_for_timeout(random.randint(*BACKOFF_EMPTY_PAGE) * 1000)
-                    raise RuntimeError(f"Empty content after click. Debug saved: {png} {html}")
+                    png, html = await _dump_debug(page, data_dir, f"fail_empty_after_click_a{attempt}")
+                    raise EmptyPageError(f"Empty after click. Debug: {png} {html}")
 
                 has_slots = not _looks_like_no_slots(normalized2)
                 summary = normalized2[:350]
@@ -192,7 +200,6 @@ async def _impl_check_once(
                     screenshot_path = str(out)
 
                 await _safe_close_context(ctx)
-
                 return CheckResult(
                     checked_at=checked_at,
                     has_slots=has_slots,
@@ -208,7 +215,6 @@ async def _impl_check_once(
                 await _safe_close_context(ctx)
                 raise last_error
 
-        # mypy/линтеру для гарантий
         await _safe_close_context(ctx)
         raise RuntimeError("Unexpected exit from check loop without result")
 
@@ -219,7 +225,6 @@ async def check_once(
     screenshot_on_slots: bool = True,
     headless: bool = True,
 ) -> CheckResult:
-    # Жёсткий таймаут на весь чек — чтобы не было пропусков тиков
     return await asyncio.wait_for(
         _impl_check_once(target_url, data_dir, screenshot_on_slots, headless),
         timeout=TOTAL_TIMEOUT_SECONDS,

@@ -5,11 +5,12 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from time import time
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from .checker import check_once, CheckResult
+from .checker import check_once, CheckResult, EmptyPageError, ContinueNotFoundError
 from .config import load_settings
 from .logging_setup import setup_logging
 from .storage.db import Database
@@ -23,6 +24,10 @@ KEY_MONITOR_ENABLED = "monitor_enabled"
 KEY_LAST_DIGEST = "last_digest"
 KEY_LAST_HAS_SLOTS = "last_has_slots"
 
+# Anti-block state (in DB settings)
+KEY_EMPTY_STREAK = "empty_streak"
+KEY_COOLDOWN_UNTIL = "cooldown_until_epoch"
+
 BTN_STATUS = "📊 Статус"
 BTN_SUBSCRIBE = "🔔 Подписаться"
 BTN_UNSUBSCRIBE = "🔕 Отписаться"
@@ -30,31 +35,42 @@ BTN_START = "🟢 Старт мониторинга"
 BTN_STOP = "🔴 Стоп мониторинга"
 BTN_INTERVAL = "⏱ Интервал"
 BTN_HELP = "ℹ️ Помощь"
+BTN_PAUSE_15 = "⏸ Пауза 15м"
+BTN_RESUME = "▶️ Возобновить"
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(BTN_STATUS), KeyboardButton(BTN_HELP)],
         [KeyboardButton(BTN_SUBSCRIBE), KeyboardButton(BTN_UNSUBSCRIBE)],
         [KeyboardButton(BTN_START), KeyboardButton(BTN_STOP)],
-        [KeyboardButton(BTN_INTERVAL)],
+        [KeyboardButton(BTN_INTERVAL), KeyboardButton(BTN_PAUSE_15), KeyboardButton(BTN_RESUME)],
     ],
     resize_keyboard=True,
 )
 
 HELP_TEXT = (
     "Я мониторю слоты записи на citaconsular.es и уведомляю подписанные чаты.\n\n"
-    "Как пользоваться:\n"
-    "1) Нажми «🔔 Подписаться» в нужном чате (личка или группа)\n"
-    "2) Нажми «🟢 Старт мониторинга»\n"
-    "3) При появлении слотов я пришлю уведомление.\n\n"
-    "Интервал можно менять кнопкой «⏱ Интервал».\n"
+    "Рекомендуемый режим (чтобы не ловить блокировки): интервал 90–180 сек.\n"
+    "Если сайт начинает отдавать пустую страницу — бот уходит в cooldown.\n\n"
+    "Кнопки:\n"
+    "🔔 Подписаться — получать уведомления в этом чате\n"
+    "🟢 Старт мониторинга — включить мониторинг\n"
+    "⏱ Интервал — поменять интервал\n"
+    "⏸ Пауза 15м — вручную поставить паузу\n"
+    "▶️ Возобновить — снять паузу\n"
 )
+
+
+def _fmt_dt_from_epoch(epoch: int) -> str:
+    if epoch <= 0:
+        return "—"
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Привет! Я готов.\n\n"
-        "Нажми «🔔 Подписаться» → потом «🟢 Старт мониторинга».",
+        "Привет! Я готов.\n\nНажми «🔔 Подписаться» → потом «🟢 Старт мониторинга».",
         reply_markup=MAIN_KB,
     )
 
@@ -86,18 +102,28 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     running = bool(context.job_queue.get_jobs_by_name(JOB_NAME))
     enabled = await db.aget_setting(KEY_MONITOR_ENABLED)
 
+    empty_streak = await db.aget_int(KEY_EMPTY_STREAK, 0)
+    cooldown_until = await db.aget_int(KEY_COOLDOWN_UNTIL, 0)
+
     last = await db.aget_last_check()
     last_line = "нет данных"
     if last.checked_at:
         last_line = f"{last.checked_at} | has_slots={last.has_slots} | {last.summary}"
 
+    now_epoch = int(time())
+    cooldown_active = cooldown_until > now_epoch
+    cooldown_line = f"{_fmt_dt_from_epoch(cooldown_until)} ({'активен' if cooldown_active else 'не активен'})"
+
     await update.message.reply_text(
         f"Мониторинг: {'🟢 запущен' if running else '🔴 остановлен'}\n"
         f"Флаг monitor_enabled: {enabled or '0'}\n"
         f"Интервал: {interval} сек\n"
+        f"Empty-streak: {empty_streak}\n"
+        f"Cooldown until: {cooldown_line}\n"
         f"Последняя проверка: {last_line}",
         reply_markup=MAIN_KB,
     )
+
 
 async def _start_monitoring_job(context: ContextTypes.DEFAULT_TYPE, interval: int) -> None:
     context.job_queue.run_repeating(
@@ -112,6 +138,7 @@ async def _start_monitoring_job(context: ContextTypes.DEFAULT_TYPE, interval: in
             "misfire_grace_time": 60,
         },
     )
+
 
 async def _restart_monitoring_job(context: ContextTypes.DEFAULT_TYPE, interval: int) -> None:
     for j in context.job_queue.get_jobs_by_name(JOB_NAME):
@@ -142,6 +169,22 @@ async def cmd_stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("🔴 Мониторинг остановлен.", reply_markup=MAIN_KB)
 
 
+async def cmd_pause_15(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.application.bot_data["db"]
+    now_epoch = int(time())
+    until = now_epoch + 15 * 60
+    await db.aset_int(KEY_COOLDOWN_UNTIL, until)
+    await db.aset_int(KEY_EMPTY_STREAK, 0)
+    await update.message.reply_text(f"⏸ Пауза до: {_fmt_dt_from_epoch(until)}", reply_markup=MAIN_KB)
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.application.bot_data["db"]
+    await db.aset_int(KEY_COOLDOWN_UNTIL, 0)
+    await db.aset_int(KEY_EMPTY_STREAK, 0)
+    await update.message.reply_text("▶️ Возобновлено. Следующий тик выполнится по расписанию.", reply_markup=MAIN_KB)
+
+
 async def _notify_all(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     db: Database = context.application.bot_data["db"]
     subs = await db.alist_subscribers()
@@ -155,6 +198,14 @@ async def _notify_all(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = context.application.bot_data["settings"]
     db: Database = context.application.bot_data["db"]
+
+    # --- cooldown gate ---
+    now_epoch = int(time())
+    cooldown_until = await db.aget_int(KEY_COOLDOWN_UNTIL, 0)
+    if cooldown_until > now_epoch:
+        # молча пропускаем, чтобы не долбить сайт
+        log.info("Cooldown active until %s, skipping tick.", _fmt_dt_from_epoch(cooldown_until))
+        return
 
     try:
         res: CheckResult = await check_once(
@@ -172,6 +223,10 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         await db.aset_setting(KEY_LAST_DIGEST, res.digest)
         await db.aset_setting(KEY_LAST_HAS_SLOTS, "1" if res.has_slots else "0")
 
+        # успех -> сбрасываем антиблок-состояние
+        await db.aset_int(KEY_EMPTY_STREAK, 0)
+        await db.aset_int(KEY_COOLDOWN_UNTIL, 0)
+
         changed = (prev_digest != res.digest)
         was_no_slots = (prev_has_slots in (None, "0"))
 
@@ -185,6 +240,36 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             await _notify_all(context, msg)
 
         log.info("Check done: has_slots=%s digest=%s summary=%s", res.has_slots, res.digest, res.summary[:120])
+
+    except EmptyPageError as e:
+        # Это главный сигнал "нас начали резать"
+        streak = await db.aget_int(KEY_EMPTY_STREAK, 0) + 1
+        await db.aset_int(KEY_EMPTY_STREAK, streak)
+
+        # стратегия cooldown: 2 подряд -> 15–25 минут, 3+ -> 25–45 минут
+        if streak >= 3:
+            minutes = random.randint(25, 45)
+        elif streak >= 2:
+            minutes = random.randint(15, 25)
+        else:
+            minutes = 0
+
+        if minutes > 0:
+            until = int(time()) + minutes * 60
+            await db.aset_int(KEY_COOLDOWN_UNTIL, until)
+            log.warning("Empty page streak=%s. Setting cooldown %s minutes until %s.", streak, minutes, _fmt_dt_from_epoch(until))
+        else:
+            log.warning("Empty page streak=%s. No cooldown yet.", streak)
+
+        log.warning("EmptyPageError: %s", e)
+
+    except ContinueNotFoundError as e:
+        # Мягче: это может быть разметка/iframe/не догрузилось. Кулдаун не всегда нужен.
+        log.warning("ContinueNotFoundError: %s", e)
+
+    except asyncio.TimeoutError:
+        # check_once превысил TOTAL_TIMEOUT_SECONDS — лучше не паниковать.
+        log.warning("Monitor tick timed out (check_once exceeded time limit).")
 
     except Exception as e:
         log.exception("Monitor tick failed: %s", e)
@@ -212,6 +297,11 @@ async def auto_restore_monitoring(app: Application) -> None:
         first=1,
         name=JOB_NAME,
         data={"interval": interval},
+        job_kwargs={
+            "max_instances": 1,
+            "coalesce": True,
+            "misfire_grace_time": 60,
+        },
     )
     log.info("Auto-restored monitoring: interval=%s sec, subscribers=%s", interval, len(subs))
 
@@ -239,10 +329,15 @@ async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if text == BTN_STOP:
         await cmd_stop_monitor(update, context)
         return
+    if text == BTN_PAUSE_15:
+        await cmd_pause_15(update, context)
+        return
+    if text == BTN_RESUME:
+        await cmd_resume(update, context)
+        return
     if text == BTN_INTERVAL:
         await update.message.reply_text(
-            "Введи интервал в секундах (минимум 30), например: 180\n"
-            "Я восприму следующее сообщение как интервал.",
+            "Введи интервал в секундах (минимум 30). Рекомендация: 90–180.\nНапример: 120",
             reply_markup=MAIN_KB,
         )
         context.user_data["awaiting_interval"] = True
@@ -251,7 +346,7 @@ async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if context.user_data.get("awaiting_interval"):
         m = re.fullmatch(r"\s*(\d+)\s*", text)
         if not m:
-            await update.message.reply_text("Нужно число. Например: 180", reply_markup=MAIN_KB)
+            await update.message.reply_text("Нужно число. Например: 120", reply_markup=MAIN_KB)
             return
         sec = max(30, int(m.group(1)))
         db: Database = context.application.bot_data["db"]
@@ -289,7 +384,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start_monitor", cmd_start_monitor))
     app.add_handler(CommandHandler("stop_monitor", cmd_stop_monitor))
 
-    # кнопки меню
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu_text))
 
     return app
