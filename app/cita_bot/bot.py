@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -66,13 +65,13 @@ async def _notify_all(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     subs = await db.alist_subscribers()
     for chat_id in subs:
         try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                disable_web_page_preview=True,
-            )
+            await context.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
         except Exception as e:
             log.warning("Failed to notify chat_id=%s: %s", chat_id, e)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Unhandled error while processing update=%r", update, exc_info=context.error)
 
 
 # ---------------- commands ----------------
@@ -81,25 +80,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Бот запущен.\n"
         "Команды:\n"
-        "/subscribe — подписаться на уведомления\n"
+        "/subscribe — подписаться\n"
         "/unsubscribe — отписаться\n"
         "/start_monitor — включить мониторинг\n"
         "/stop_monitor — выключить\n"
         "/status — статус\n"
-        "/set_interval <сек> — интервал (рекомендация: 90–300)\n",
+        "/set_interval <сек> — интервал\n\n"
+        "Можно пользоваться кнопками ниже 👇",
         reply_markup=main_keyboard(),
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Доступно:\n"
+        "Кнопки:\n"
         f"- {BTN_STATUS}\n"
         f"- {BTN_SUB} / {BTN_UNSUB}\n"
         f"- {BTN_START} / {BTN_STOP}\n"
-        f"- {BTN_INTERVAL} (подсказка по /set_interval)\n\n"
-        "Команды тоже работают:\n"
-        "/status, /subscribe, /unsubscribe, /start_monitor, /stop_monitor, /set_interval 300",
+        f"- {BTN_INTERVAL}\n\n"
+        "Тест: отправь `ping` — отвечу `pong`.",
         reply_markup=main_keyboard(),
     )
 
@@ -109,7 +108,7 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat_id = update.effective_chat.id
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     await db.aadd_subscriber(chat_id, created_at)
-    await update.message.reply_text("✅ Подписка включена для этого чата.", reply_markup=main_keyboard())
+    await update.message.reply_text("✅ Подписка включена.", reply_markup=main_keyboard())
 
 
 async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -172,19 +171,14 @@ async def cmd_set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Использование: /set_interval 300", reply_markup=main_keyboard())
         return
 
-    try:
-        sec = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Нужно число. Например: /set_interval 300", reply_markup=main_keyboard())
-        return
-
-    sec = max(90, sec)  # защита: не ниже 90
+    sec = int(context.args[0])
+    sec = max(90, sec)
     await db.aset_setting(KEY_INTERVAL, str(sec))
-    await update.message.reply_text(f"✅ Интервал установлен: {sec} сек (мин. 90).", reply_markup=main_keyboard())
+    await update.message.reply_text(f"✅ Интервал: {sec} сек.", reply_markup=main_keyboard())
 
     if context.job_queue.get_jobs_by_name(JOB_NAME):
         await _restart_job(context, sec)
-        await update.message.reply_text("🔁 Мониторинг перезапущен с новым интервалом.", reply_markup=main_keyboard())
+        await update.message.reply_text("🔁 Мониторинг перезапущен.", reply_markup=main_keyboard())
 
 
 async def cmd_start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -199,7 +193,7 @@ async def cmd_start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     interval = max(90, interval)
     await db.aset_setting(KEY_MONITOR_ENABLED, "1")
     await _start_job(context, interval)
-    await update.message.reply_text(f"🟢 Мониторинг запущен. Интервал: {interval} сек.", reply_markup=main_keyboard())
+    await update.message.reply_text(f"🟢 Мониторинг запущен ({interval} сек).", reply_markup=main_keyboard())
 
 
 async def cmd_stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -213,42 +207,35 @@ async def cmd_stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # ---------------- reply-keyboard router ----------------
 
 async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # сюда попадают нажатия кнопок ReplyKeyboard (это просто текст)
     if not update.message or not update.message.text:
         return
 
     t = update.message.text.strip()
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    log.info("INCOMING message chat_id=%s text=%r", chat_id, t)
+
+    # железный тест
+    if t.lower() == "ping":
+        await update.message.reply_text("pong", reply_markup=main_keyboard())
+        return
 
     if t == BTN_STATUS:
-        await cmd_status(update, context)
-        return
+        await cmd_status(update, context); return
     if t == BTN_HELP:
-        await cmd_help(update, context)
-        return
+        await cmd_help(update, context); return
     if t == BTN_SUB:
-        await cmd_subscribe(update, context)
-        return
+        await cmd_subscribe(update, context); return
     if t == BTN_UNSUB:
-        await cmd_unsubscribe(update, context)
-        return
+        await cmd_unsubscribe(update, context); return
     if t == BTN_START:
-        await cmd_start_monitor(update, context)
-        return
+        await cmd_start_monitor(update, context); return
     if t == BTN_STOP:
-        await cmd_stop_monitor(update, context)
-        return
+        await cmd_stop_monitor(update, context); return
     if t == BTN_INTERVAL:
-        await update.message.reply_text(
-            "Чтобы изменить интервал:\n/set_interval 300\n(минимум 90 сек)",
-            reply_markup=main_keyboard(),
-        )
+        await update.message.reply_text("Сменить интервал: /set_interval 300 (мин. 90)", reply_markup=main_keyboard())
         return
 
-    # если человек написал что-то руками — просто показываем подсказку
-    await update.message.reply_text(
-        "Не понял команду. Нажми кнопку или используй /help (или /start).",
-        reply_markup=main_keyboard(),
-    )
+    await update.message.reply_text("Не понял. Нажми кнопку или /help.", reply_markup=main_keyboard())
 
 
 # ---------------- monitor job ----------------
@@ -257,7 +244,6 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = context.application.bot_data["settings"]
     db: Database = context.application.bot_data["db"]
 
-    # cooldown gate
     now_epoch = int(now_time())
     cooldown_until = await db.aget_int(KEY_COOLDOWN_UNTIL, 0)
     if cooldown_until > now_epoch:
@@ -279,7 +265,6 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         await db.aset_setting(KEY_LAST_DIGEST, res.digest)
         await db.aset_setting(KEY_LAST_HAS_SLOTS, "1" if res.has_slots else "0")
 
-        # success -> reset anti-block state
         await db.aset_int(KEY_EMPTY_STREAK, 0)
         await db.aset_int(KEY_COOLDOWN_UNTIL, 0)
 
@@ -288,14 +273,14 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if res.has_slots and (changed or was_no_slots):
             msg = (
-                "✅ Похоже, появились доступные слоты!\n\n"
-                f"Время проверки: {res.checked_at}\n"
+                "✅ Похоже, появились слоты!\n"
+                f"Время: {res.checked_at}\n"
                 f"URL: {settings.target_url}\n\n"
-                f"Фрагмент: {res.summary}"
+                f"{res.summary}"
             )
             await _notify_all(context, msg)
 
-        log.info("Check done: has_slots=%s digest=%s summary=%s", res.has_slots, res.digest, res.summary[:120])
+        log.info("Check done: has_slots=%s digest=%s", res.has_slots, res.digest)
 
     except EmptyPageError as e:
         streak = await db.aget_int(KEY_EMPTY_STREAK, 0) + 1
@@ -311,13 +296,10 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         until = int(now_time()) + minutes * 60
         await db.aset_int(KEY_COOLDOWN_UNTIL, until)
 
-        log.warning("EmptyPageError streak=%s. Cooldown %s min until %s. %s", streak, minutes, _fmt_dt(until), e)
+        log.warning("EmptyPageError streak=%s cooldown=%smin until=%s. %s", streak, minutes, _fmt_dt(until), e)
 
     except ContinueNotFoundError as e:
         log.warning("ContinueNotFoundError: %s", e)
-
-    except asyncio.TimeoutError:
-        log.warning("Monitor tick timed out (check_once exceeded limit).")
 
     except Exception as e:
         log.exception("Monitor tick failed: %s", e)
@@ -366,7 +348,8 @@ def build_app() -> Application:
     app.bot_data["settings"] = settings
     app.bot_data["db"] = db
 
-    # commands
+    app.add_error_handler(on_error)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
