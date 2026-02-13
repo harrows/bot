@@ -101,7 +101,7 @@ class Database:
         if not v:
             return default_value
         try:
-            return max(30, int(v))
+            return max(90, int(v))
         except ValueError:
             return default_value
 

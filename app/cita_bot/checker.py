@@ -13,14 +13,11 @@ from playwright.async_api import async_playwright, Page, Frame, BrowserContext
 from playwright._impl._errors import TargetClosedError
 
 
-# ---- Быстрый и устойчивый чек (без длинных sleep внутри) ----
+# --- timeouts / attempts ---
 MAX_ATTEMPTS = 2
-
 NAV_TIMEOUT_MS = 45_000
 CLICK_TIMEOUT_MS = 30_000
-
-# Жёсткий лимит на один check_once (чтобы не блокировать job)
-TOTAL_TIMEOUT_SECONDS = 70
+TOTAL_TIMEOUT_SECONDS = 70  # лимит на весь check_once, чтобы тик не зависал
 
 NO_SLOTS_PATTERNS = [
     r"No hay horas disponibles",
@@ -29,7 +26,7 @@ NO_SLOTS_PATTERNS = [
 
 
 class EmptyPageError(RuntimeError):
-    """Сайт отдал пустую/заглушечную страницу (часто антибот/soft-block)."""
+    """Сайт отдал пустую/заглушечную страницу (часто soft-block/защита)."""
 
 
 class ContinueNotFoundError(RuntimeError):
@@ -62,6 +59,7 @@ def _make_digest(text: str) -> str:
 
 async def _dump_debug(page: Page, data_dir: Path, prefix: str) -> tuple[str, str]:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    (data_dir / "screenshots").mkdir(parents=True, exist_ok=True)
     png = data_dir / "screenshots" / f"{prefix}_{ts}.png"
     html = data_dir / "screenshots" / f"{prefix}_{ts}.html"
     await page.screenshot(path=str(png), full_page=True)
@@ -137,8 +135,13 @@ async def _impl_check_once(
         )
         page = await ctx.new_page()
 
-        # Принять alert("...OK...")
-        page.on("dialog", lambda d: asyncio.create_task(d.accept()))
+        async def _safe_accept(dialog):
+            try:
+                await dialog.accept()
+            except Exception:
+                pass
+
+        page.on("dialog", lambda d: asyncio.create_task(_safe_accept(d)))
 
         last_error: Optional[Exception] = None
 
@@ -149,9 +152,8 @@ async def _impl_check_once(
 
                 resp = await page.goto(target_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
                 await _safe_networkidle(page, 20_000)
-                await page.wait_for_timeout(random.randint(300, 900))
+                await page.wait_for_timeout(random.randint(200, 700))
 
-                # Если сайт отвечает странно — сохраним статус в html (иногда 403/503)
                 status = None
                 try:
                     if resp:
@@ -159,13 +161,14 @@ async def _impl_check_once(
                 except Exception:
                     status = None
 
-                # Проверка на "пустую страницу"
+                # Если "пусто" — это ключевой сигнал. Не ждём минутами, сразу отдаём вверх.
+                body_text = ""
                 try:
                     body_text = await page.inner_text("body")
                 except Exception:
                     body_text = ""
-                normalized = _normalize(body_text or "")
 
+                normalized = _normalize(body_text or "")
                 if len(normalized) < 5:
                     png, html = await _dump_debug(page, data_dir, f"fail_empty_s{status}_a{attempt}")
                     raise EmptyPageError(f"Empty page (status={status}). Debug: {png} {html}")
@@ -179,11 +182,15 @@ async def _impl_check_once(
                 await btn.click(timeout=CLICK_TIMEOUT_MS)
 
                 await _safe_networkidle(page, 20_000)
-                await page.wait_for_timeout(random.randint(400, 1000))
+                await page.wait_for_timeout(random.randint(250, 800))
 
-                body_text2 = await page.inner_text("body")
+                body_text2 = ""
+                try:
+                    body_text2 = await page.inner_text("body")
+                except Exception:
+                    body_text2 = ""
+
                 normalized2 = _normalize(body_text2 or "")
-
                 if len(normalized2) < 20:
                     png, html = await _dump_debug(page, data_dir, f"fail_empty_after_click_a{attempt}")
                     raise EmptyPageError(f"Empty after click. Debug: {png} {html}")
@@ -216,7 +223,7 @@ async def _impl_check_once(
                 raise last_error
 
         await _safe_close_context(ctx)
-        raise RuntimeError("Unexpected exit from check loop without result")
+        raise RuntimeError("Unexpected exit without result")
 
 
 async def check_once(
