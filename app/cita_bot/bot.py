@@ -1,14 +1,21 @@
+cat > /root/bot/app/cita_bot/bot.py <<'PY'
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from time import time as now_time
-import random
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 from .checker import check_once, CheckResult, EmptyPageError, ContinueNotFoundError
 from .config import load_settings
@@ -23,9 +30,28 @@ KEY_INTERVAL = "interval_seconds"
 KEY_MONITOR_ENABLED = "monitor_enabled"
 KEY_LAST_DIGEST = "last_digest"
 KEY_LAST_HAS_SLOTS = "last_has_slots"
-
 KEY_EMPTY_STREAK = "empty_streak"
 KEY_COOLDOWN_UNTIL = "cooldown_until_epoch"
+
+
+# --- UI labels (ReplyKeyboard sends plain text) ---
+BTN_STATUS = "📊 Статус"
+BTN_HELP = "ℹ️ Помощь"
+BTN_SUB = "🔔 Подписаться"
+BTN_UNSUB = "🔕 Отписаться"
+BTN_START = "🟢 Старт мониторинга"
+BTN_STOP = "🔴 Стоп мониторинга"
+BTN_INTERVAL = "🕒 Интервал"
+
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton(BTN_STATUS), KeyboardButton(BTN_HELP)],
+        [KeyboardButton(BTN_SUB), KeyboardButton(BTN_UNSUB)],
+        [KeyboardButton(BTN_START), KeyboardButton(BTN_STOP)],
+        [KeyboardButton(BTN_INTERVAL)],
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True, is_persistent=True)
 
 
 def _fmt_dt(epoch: int) -> str:
@@ -40,10 +66,16 @@ async def _notify_all(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     subs = await db.alist_subscribers()
     for chat_id in subs:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                disable_web_page_preview=True,
+            )
         except Exception as e:
             log.warning("Failed to notify chat_id=%s: %s", chat_id, e)
 
+
+# ---------------- commands ----------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -54,7 +86,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/start_monitor — включить мониторинг\n"
         "/stop_monitor — выключить\n"
         "/status — статус\n"
-        "/set_interval <сек> — интервал (рекомендация: 90–300)\n"
+        "/set_interval <сек> — интервал (рекомендация: 90–300)\n",
+        reply_markup=main_keyboard(),
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Доступно:\n"
+        f"- {BTN_STATUS}\n"
+        f"- {BTN_SUB} / {BTN_UNSUB}\n"
+        f"- {BTN_START} / {BTN_STOP}\n"
+        f"- {BTN_INTERVAL} (подсказка по /set_interval)\n\n"
+        "Команды тоже работают:\n"
+        "/status, /subscribe, /unsubscribe, /start_monitor, /stop_monitor, /set_interval 300",
+        reply_markup=main_keyboard(),
     )
 
 
@@ -63,14 +109,14 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat_id = update.effective_chat.id
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     await db.aadd_subscriber(chat_id, created_at)
-    await update.message.reply_text("✅ Подписка включена для этого чата.")
+    await update.message.reply_text("✅ Подписка включена для этого чата.", reply_markup=main_keyboard())
 
 
 async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: Database = context.application.bot_data["db"]
     chat_id = update.effective_chat.id
     await db.aremove_subscriber(chat_id)
-    await update.message.reply_text("🟡 Подписка отключена для этого чата.")
+    await update.message.reply_text("🔕 Подписка отключена.", reply_markup=main_keyboard())
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -80,7 +126,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     interval = await db.aget_interval_seconds(settings.default_interval_seconds)
     running = bool(context.job_queue.get_jobs_by_name(JOB_NAME))
     enabled = await db.aget_setting(KEY_MONITOR_ENABLED)
-
     empty_streak = await db.aget_int(KEY_EMPTY_STREAK, 0)
     cooldown_until = await db.aget_int(KEY_COOLDOWN_UNTIL, 0)
     cooldown_active = cooldown_until > int(now_time())
@@ -96,7 +141,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Интервал: {interval} сек\n"
         f"Empty-streak: {empty_streak}\n"
         f"Cooldown until: {_fmt_dt(cooldown_until)} ({'активен' if cooldown_active else 'не активен'})\n"
-        f"Последняя проверка: {last_line}"
+        f"Последняя проверка: {last_line}",
+        reply_markup=main_keyboard(),
     )
 
 
@@ -123,24 +169,22 @@ async def cmd_set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     settings = context.application.bot_data["settings"]
 
     if not context.args:
-        await update.message.reply_text("Использование: /set_interval 300")
+        await update.message.reply_text("Использование: /set_interval 300", reply_markup=main_keyboard())
         return
 
     try:
         sec = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Нужно число. Например: /set_interval 300")
+        await update.message.reply_text("Нужно число. Например: /set_interval 300", reply_markup=main_keyboard())
         return
 
-    # Жёсткая защита: не даём ставить ниже 90
-    sec = max(90, sec)
-
+    sec = max(90, sec)  # защита: не ниже 90
     await db.aset_setting(KEY_INTERVAL, str(sec))
-    await update.message.reply_text(f"✅ Интервал установлен: {sec} сек (мин. 90).")
+    await update.message.reply_text(f"✅ Интервал установлен: {sec} сек (мин. 90).", reply_markup=main_keyboard())
 
     if context.job_queue.get_jobs_by_name(JOB_NAME):
         await _restart_job(context, sec)
-        await update.message.reply_text("🔁 Мониторинг перезапущен с новым интервалом.")
+        await update.message.reply_text("🔁 Мониторинг перезапущен с новым интервалом.", reply_markup=main_keyboard())
 
 
 async def cmd_start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -148,14 +192,14 @@ async def cmd_start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     settings = context.application.bot_data["settings"]
 
     if context.job_queue.get_jobs_by_name(JOB_NAME):
-        await update.message.reply_text("Мониторинг уже запущен.")
+        await update.message.reply_text("Мониторинг уже запущен.", reply_markup=main_keyboard())
         return
 
     interval = await db.aget_interval_seconds(settings.default_interval_seconds)
-    interval = max(90, interval)  # доп. защита
+    interval = max(90, interval)
     await db.aset_setting(KEY_MONITOR_ENABLED, "1")
     await _start_job(context, interval)
-    await update.message.reply_text(f"🟢 Мониторинг запущен. Интервал: {interval} сек.")
+    await update.message.reply_text(f"🟢 Мониторинг запущен. Интервал: {interval} сек.", reply_markup=main_keyboard())
 
 
 async def cmd_stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -163,8 +207,51 @@ async def cmd_stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     for j in context.job_queue.get_jobs_by_name(JOB_NAME):
         j.schedule_removal()
     await db.aset_setting(KEY_MONITOR_ENABLED, "0")
-    await update.message.reply_text("🔴 Мониторинг остановлен.")
+    await update.message.reply_text("🔴 Мониторинг остановлен.", reply_markup=main_keyboard())
 
+
+# ---------------- reply-keyboard router ----------------
+
+async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # сюда попадают нажатия кнопок ReplyKeyboard (это просто текст)
+    if not update.message or not update.message.text:
+        return
+
+    t = update.message.text.strip()
+
+    if t == BTN_STATUS:
+        await cmd_status(update, context)
+        return
+    if t == BTN_HELP:
+        await cmd_help(update, context)
+        return
+    if t == BTN_SUB:
+        await cmd_subscribe(update, context)
+        return
+    if t == BTN_UNSUB:
+        await cmd_unsubscribe(update, context)
+        return
+    if t == BTN_START:
+        await cmd_start_monitor(update, context)
+        return
+    if t == BTN_STOP:
+        await cmd_stop_monitor(update, context)
+        return
+    if t == BTN_INTERVAL:
+        await update.message.reply_text(
+            "Чтобы изменить интервал:\n/set_interval 300\n(минимум 90 сек)",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    # если человек написал что-то руками — просто показываем подсказку
+    await update.message.reply_text(
+        "Не понял команду. Нажми кнопку или используй /help (или /start).",
+        reply_markup=main_keyboard(),
+    )
+
+
+# ---------------- monitor job ----------------
 
 async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = context.application.bot_data["settings"]
@@ -184,7 +271,6 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             screenshot_on_slots=settings.screenshot_on_slots,
             headless=True,
         )
-
         await db.aupdate_last_check(res.checked_at, res.has_slots, res.summary)
 
         prev_digest = await db.aget_setting(KEY_LAST_DIGEST)
@@ -202,7 +288,7 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if res.has_slots and (changed or was_no_slots):
             msg = (
-                "🟢 Похоже, появились доступные слоты!\n\n"
+                "✅ Похоже, появились доступные слоты!\n\n"
                 f"Время проверки: {res.checked_at}\n"
                 f"URL: {settings.target_url}\n\n"
                 f"Фрагмент: {res.summary}"
@@ -212,7 +298,6 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.info("Check done: has_slots=%s digest=%s summary=%s", res.has_slots, res.digest, res.summary[:120])
 
     except EmptyPageError as e:
-        # soft-block: увеличиваем streak и ставим cooldown
         streak = await db.aget_int(KEY_EMPTY_STREAK, 0) + 1
         await db.aset_int(KEY_EMPTY_STREAK, streak)
 
@@ -229,7 +314,6 @@ async def monitor_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("EmptyPageError streak=%s. Cooldown %s min until %s. %s", streak, minutes, _fmt_dt(until), e)
 
     except ContinueNotFoundError as e:
-        # мягкая ошибка — не ставим большой cooldown
         log.warning("ContinueNotFoundError: %s", e)
 
     except asyncio.TimeoutError:
@@ -282,13 +366,18 @@ def build_app() -> Application:
     app.bot_data["settings"] = settings
     app.bot_data["db"] = db
 
+    # commands
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("set_interval", cmd_set_interval))
     app.add_handler(CommandHandler("start_monitor", cmd_start_monitor))
     app.add_handler(CommandHandler("stop_monitor", cmd_stop_monitor))
+
+    # reply-keyboard buttons (plain text)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu_text))
 
     return app
 
@@ -297,3 +386,4 @@ def main() -> None:
     app = build_app()
     log.info("Starting bot polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+PY
