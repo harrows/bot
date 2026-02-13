@@ -1,4 +1,4 @@
-cat > /root/bot/app/cita_bot/bot.py <<'PY'
+
 from __future__ import annotations
 
 import asyncio
@@ -386,4 +386,3 @@ def main() -> None:
     app = build_app()
     log.info("Starting bot polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-PY
